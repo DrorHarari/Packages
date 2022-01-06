@@ -139,6 +139,10 @@ class CalcVarHandler:
                 forbidden.add(v)
         for v in forbidden:
                 self.calc_vars.pop(v)
+                
+        # Update variables from simple dict
+        upgrade = lambda x: x if isinstance(x,dict) else {"val":x, "expr": ""}
+        self.calc_vars = {v: upgrade(self.calc_vars[v]) for v in self.calc_vars.keys()}
 
     def load_vars(self):
         self.save_var_parser = re.compile(self.SAVE_VAR_PARSER)
@@ -154,19 +158,27 @@ class CalcVarHandler:
     def vars(self):
         return self.calc_vars.copy().items()
 
-    def save_if_var(self, ans):
-        if not self.var_to_save:
+    def save_if_var(self, var_to_save, ans, expr):
+        if not var_to_save:
             return
-        if self.var_to_save in self.constants.keys():
-            self.plugin.warn(f"A constant, {self.var_to_save}, cannot be modified.")
+        if var_to_save in self.constants.keys():
+            self.plugin.warn(f"A constant, {var_to_save}, cannot be modified.")
             return
-        if self.var_to_save in keyword.kwlist:
-            self.plugin.warn(f"A Python keyword, {self.var_to_save}, cannot be used as variable name.")
+        if var_to_save in keyword.kwlist:
+            self.plugin.warn(f"A Python keyword, {var_to_save}, cannot be used as variable name.")
             return
+
+        # Recurse to also update the named variable
+        if var_to_save == "ans" and expr in self.calc_vars and not expr == "ans":
+            self.save_if_var(expr, ans, self.calc_vars[expr]["expr"])
 
         if isinstance(ans, Number):
             ans = ans.__float__()
-        self.calc_vars[self.var_to_save] = ans
+        if not var_to_save in self.calc_vars:
+            self.calc_vars[var_to_save] = {}
+
+        self.calc_vars[var_to_save]["val"] = ans
+        self.calc_vars[var_to_save]["expr"] = expr.strip() if not str(expr) == str(ans) else ""
         self.save()
 
     def save(self):
@@ -198,7 +210,8 @@ class CalcVarHandler:
         return (expr, suffix)
 
     def update_calc_vars(self, own_names):
-        own_names.update(self.calc_vars)
+        updater = {v: self.calc_vars[v]["val"] for v in self.calc_vars}
+        own_names.update(updater)
 
     def delete_var(self, var, current_vars):
         if var in self.calc_vars:
@@ -220,6 +233,7 @@ class Calc(kp.Plugin):
     Evaluates a mathematical expression and shows its result.
     """
     ITEMCAT_VAR = kp.ItemCategory.USER_BASE + 1
+    ITEMCAT_RECALC = kp.ItemCategory.USER_BASE + 2
     VARS_KEYWORD = "Calc: Variables"
     DEFAULT_KEYWORD = "="
     DEFAULT_ALWAYS_EVALUATE = True
@@ -395,6 +409,12 @@ class Calc(kp.Plugin):
                 label="Delete All",
                 short_desc="Press Enter to delete all variables")
         ])
+        self.set_actions(self.ITEMCAT_RECALC, [
+            self.create_action(
+                name="update",
+                label="Update",
+                short_desc="Press Enter to update this variable")
+        ])
 
     def on_catalog(self):
         self.set_catalog([
@@ -413,41 +433,75 @@ class Calc(kp.Plugin):
                 args_hint=kp.ItemArgsHint.REQUIRED,
                 hit_hint=kp.ItemHitHint.NOARGS)])
 
+    def semicalc(self, expression):
+        while True:
+            semipos = expression.find(";")
+            if semipos < 0:
+                return expression
+            elif semipos == 0:
+                expression = expression[1:]
+            elif len(expression) > semipos and (expression[semipos+1].isalnum() or expression[semipos+1] in "(){}[]"):
+                return f"error: {expression}"
+            else:
+                expression = f"({expression[0:semipos]}){expression[semipos+1:]}"
+
     def on_suggest(self, user_input, items_chain):
+        var_handler = self.var_handler
+        suggestions = []
         if items_chain and items_chain[0].category() == self.ITEMCAT_VAR:
-            suggestions = []
-            for i,(var,val) in enumerate(self.var_handler.vars()):
+            expr_label = lambda x: f"   ({x})" if x else ""
+            for i,(var,val) in enumerate(var_handler.vars()):
                 suggestions.append(self.create_item(
                     category=self.ITEMCAT_VAR,
-                    label=f"{var} = {val}",
+                    label=f"{var} = {val['val']}{expr_label(val['expr'])}",
                     short_desc="Press Enter to copy the result",
-                    target=str(val),
+                    target=str(val['val']),
                     args_hint=kp.ItemArgsHint.FORBIDDEN,
                     hit_hint=kp.ItemHitHint.IGNORE,
                     data_bag = var))
             self.set_suggestions(suggestions, kp.Match.ANY, kp.Sort.LABEL_ASC)
             return
+        elif items_chain and items_chain[0].category() == self.ITEMCAT_RECALC:
+            expression = items_chain[0].data_bag()
+            var_handler.var_to_save = items_chain[0].target()
+            eval_requested = False
+            suffix = None
+        else:
+            if not len(user_input):
+                return
+            if items_chain and (
+                    items_chain[0].category() != kp.ItemCategory.KEYWORD or
+                    items_chain[0].target() != self.DEFAULT_KEYWORD):
+                return
 
-        if not len(user_input):
-            return
-        if items_chain and (
-                items_chain[0].category() != kp.ItemCategory.KEYWORD or
-                items_chain[0].target() != self.DEFAULT_KEYWORD):
-            return
+            eval_requested = False
+            expression, suffix = var_handler.expression_to_evaluate(user_input, self.always_evaluate)
+            if expression:
+                # always evaluate if an assignment is made or = (DEFAULT_KEYWORD) is used
+                eval_requested = True
+            elif items_chain:
+                eval_requested = True
+            elif not items_chain and not self.always_evaluate:
+                return
 
-        eval_requested = False
-        expression, suffix = self.var_handler.expression_to_evaluate(user_input, self.always_evaluate)
-        if expression:
-            # always evaluate if an assignment is made or = (DEFAULT_KEYWORD) is used
-            eval_requested = True
-        elif items_chain:
-            eval_requested = True
-        elif not items_chain and not self.always_evaluate:
-            return
+        # If the expression is a variable name with expression - add option to update
+        if expression in var_handler.calc_vars.keys() \
+           and var_handler.calc_vars[expression]["expr"]:
+            suggestions.append(self.create_item(
+                category=self.ITEMCAT_RECALC,
+                label=f"{expression} = {var_handler.calc_vars[expression]['expr']}",
+                short_desc="Press Enter to update the variable",
+                target=expression,
+                args_hint=kp.ItemArgsHint.REQUIRED,
+                hit_hint=kp.ItemHitHint.IGNORE,
+                data_bag=var_handler.calc_vars[expression]["expr"]))
+            # old_ans = None
+            # old_expr = expression
+            # old_ans = self.var_handler.calc_vars[expression]["val"]
+            # expression = self.var_handler.calc_vars[expression]["expr"]
 
-        suggestions = []
         try:
-            results = self._eval(expression)
+            results = self._eval(self.semicalc(expression))
             if not isinstance(results, (tuple, list)):
                 results = (results,)
             for res in results:
@@ -463,9 +517,11 @@ class Calc(kp.Plugin):
                     short_desc=short_desc,
                     target=res,
                     args_hint=kp.ItemArgsHint.FORBIDDEN,
-                    hit_hint=kp.ItemHitHint.IGNORE))
+                    hit_hint=kp.ItemHitHint.IGNORE,
+                    data_bag=expression),
+                )
         except Exception as exc:
-            if suffix or not eval_requested or self.var_handler.var_to_save == self.ANSWER_VARIABLE:
+            if suffix or not eval_requested or var_handler.var_to_save == self.ANSWER_VARIABLE:
                 # stay quiet if evaluation hasn't been explicitly requested or
                 # if suffix format to avoid getting exceptions of things like:
                 # https://www.youtube.com/watch?v=abcdef
@@ -478,16 +534,19 @@ class Calc(kp.Plugin):
         self.set_suggestions(suggestions, kp.Match.ANY, kp.Sort.NONE)
 
     def on_execute(self, item, action):
+        var_handler = self.var_handler
         if item and item.category() == kp.ItemCategory.EXPRESSION:
             kpu.set_clipboard(item.target())
-            self.var_handler.save_if_var(self.ans)
+            expr = item.data_bag()
+            var_handler.save_if_var(var_handler.var_to_save, self.ans, expr)
         elif item and (item.category() == self.ITEMCAT_VAR):
-            if action and action.name() == "copy":
-                kpu.set_clipboard(item.target())
-            elif action and action.name() == "delete":
-                self.var_handler.delete_var(item.data_bag(), self.MATH_CONSTANTS)
+            if action and action.name() == "delete":
+                var_handler.delete_var(item.data_bag(), self.MATH_CONSTANTS)
             elif action and action.name() == "delete_all":
-                self.var_handler.delete_all_vars(self.MATH_CONSTANTS)
+                var_handler.delete_all_vars(self.MATH_CONSTANTS)
+            else: # not action or action.name() == "copy":
+                kpu.set_clipboard(item.target())
+
 
     def on_events(self, flags):
         if flags & kp.Events.PACKCONFIG:
