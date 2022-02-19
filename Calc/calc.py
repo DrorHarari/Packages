@@ -438,6 +438,8 @@ class Calc(kp.Plugin):
             semipos = expression.find(";")
             if semipos < 0:
                 return expression
+            elif semipos + 1 == len(expression):
+                expression = expression[0:-1]
             elif semipos == 0:
                 expression = expression[1:]
             elif len(expression) > semipos and (expression[semipos+1].isalnum() or expression[semipos+1] in "(){}[]"):
